@@ -1,4 +1,6 @@
-from app import app
+"""Compatibility entrypoint; prefer `uvicorn app.main:app` from Server/."""
+
+import uvicorn
 
 if __name__ == "__main__":
-    app.run(debug=True, host='localhost')
+    uvicorn.run("app.main:app", host="127.0.0.1", port=8000)

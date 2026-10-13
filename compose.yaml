@@ -1,0 +1,77 @@
+services:
+  db:
+    image: pgvector/pgvector:0.8.2-pg17
+    environment:
+      POSTGRES_DB: autism_insight
+      POSTGRES_USER: autism
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-dev-only}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autism -d autism_insight"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  migrate:
+    build: ./Server
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://autism:${POSTGRES_PASSWORD:-local-dev-only}@db:5432/autism_insight
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    build: ./Server
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://autism:${POSTGRES_PASSWORD:-local-dev-only}@db:5432/autism_insight
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/live')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  web:
+    build: ./Client
+    ports:
+      - "127.0.0.1:5173:80"
+    depends_on:
+      api:
+        condition: service_started
+
+  ingest:
+    build: ./Server
+    profiles: ["tools"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://autism:${POSTGRES_PASSWORD:-local-dev-only}@db:5432/autism_insight
+    command: ["python", "-m", "app.ingest", "/app/app/Asperger.pdf", "--source-key", "asperger-demo", "--title", "Asperger — documento de prueba", "--trust-level", "demo"]
+    volumes:
+      - ./knowledge:/knowledge:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  cleanup:
+    build: ./Server
+    profiles: ["tools"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://autism:${POSTGRES_PASSWORD:-local-dev-only}@db:5432/autism_insight
+    command: ["python", "-m", "app.maintenance"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  postgres_data:
