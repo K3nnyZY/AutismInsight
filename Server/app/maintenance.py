@@ -1,4 +1,7 @@
-"""Run daily to enforce retention. No prompts or conversation content are printed."""
+"""Limpieza manual o programada de sesiones vencidas y contadores antiguos.
+
+Ejecutar diariamente: `python -m app.maintenance`. La API no programa esta tarea.
+"""
 
 import asyncio
 
@@ -10,6 +13,11 @@ from app.models import Conversation
 
 
 async def main():
+    """Borra conversaciones vencidas y contadores de más de 120 minutos.
+
+    La base elimina los mensajes en cascada. Imprime solo el número
+    de conversaciones eliminadas y libera las conexiones al terminar.
+    """
     database = Database(get_settings())
     try:
         async with database.sessions.begin() as session:

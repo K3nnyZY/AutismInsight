@@ -1,4 +1,8 @@
-"""Administrator-only CLI: read local documents, embed once, replace atomically."""
+"""Herramienta local de ingesta: leer, dividir, vectorizar y actualizar documentos.
+
+Se ejecuta como `python -m app.ingest`. Envía fragmentos al proveedor
+de embeddings; no es un endpoint de subida ni implementa roles de usuario.
+"""
 
 import argparse
 import asyncio
@@ -25,6 +29,12 @@ MAX_CHUNKS = 2000
 
 
 def load_pages(path: Path) -> list[LangDocument]:
+    """Extrae páginas de un PDF con texto o lee un TXT/Markdown UTF-8.
+
+    Las páginas de PDF se numeran desde 1; los archivos de texto usan page=None.
+    Rechaza archivos de más de 20 MiB, PDF cifrados, más de 500 páginas,
+    formatos no admitidos y documentos sin texto extraído. No realiza OCR.
+    """
     if path.stat().st_size > MAX_FILE_BYTES:
         raise ValueError("Document exceeds 20 MiB.")
     if path.suffix.lower() == ".pdf":
@@ -50,6 +60,11 @@ def load_pages(path: Path) -> list[LangDocument]:
 
 
 def split_pages(pages: list[LangDocument]) -> list[LangDocument]:
+    """Divide cada página en fragmentos de 600 tokens con solapamiento de 90.
+
+    Preserva los metadatos de página, utiliza cl100k_base y rechaza
+    documentos que produzcan más de 2000 fragmentos.
+    """
     splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
         encoding_name="cl100k_base",
         chunk_size=CHUNK_TOKENS,
@@ -63,6 +78,11 @@ def split_pages(pages: list[LangDocument]) -> list[LangDocument]:
 
 
 def document_fingerprint(path: Path, signature: str, metadata: dict) -> str:
+    """Calcula SHA-256 de contenido, firma de embeddings, división y metadatos.
+
+    La huella permite reconocer una fuente sin cambios antes de pagar
+    nuevos embeddings; un cambio de título o confianza también modifica la huella.
+    """
     digest = hashlib.sha256(path.read_bytes())
     digest.update(
         json.dumps(
@@ -89,6 +109,21 @@ async def ingest(
     source_url: str | None,
     trust_level: str,
 ) -> dict:
+    """Indexa o reemplaza una fuente identificada por source_key de forma transaccional.
+
+    Calcula embeddings en lotes de 32 antes de modificar el índice activo.
+    Después bloquea la source_key y vuelve a comprobar la huella para evitar
+    reemplazos concurrentes incoherentes. Una actualización conserva el UUID
+    del documento y reemplaza sus fragmentos. Una URL es solo metadato: no se descarga.
+
+    Returns:
+        Diccionario con status (indexed o unchanged), document_id y chunks.
+
+    Raises:
+        ValueError: Metadatos, documento o vectores no válidos.
+        Exception: Los fallos de base o proveedor se propagan; una transacción
+            fallida revierte sus cambios.
+    """
     if trust_level not in {"demo", "reviewed"}:
         raise ValueError("Invalid trust level.")
     if not title.strip() or len(title) > 300 or not source_key.strip() or len(source_key) > 300:
@@ -111,7 +146,7 @@ async def ingest(
         old = await session.scalar(select(Document).where(Document.source_key == source_key))
         if old and old.fingerprint == fingerprint:
             return {"status": "unchanged", "document_id": str(old.id), "chunks": len(chunks)}
-    # Compute all embeddings before touching the active index. Bound each provider request.
+    # Obtiene los vectores antes de modificar el índice: un fallo conserva la fuente anterior.
     vectors = []
     for start in range(0, len(chunks), 32):
         batch = chunks[start : start + 32]
@@ -119,7 +154,7 @@ async def ingest(
     if len(vectors) != len(chunks) or any(len(v) != EMBEDDING_DIMENSIONS for v in vectors):
         raise ValueError("Unexpected embedding dimensions or count.")
     async with database.sessions.begin() as session:
-        # Serialize same-source replacements, including concurrent first ingestion.
+        # Serializa ingestas de la misma fuente, también cuando todavía no existe una fila.
         await session.execute(
             text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 1))"), {"key": source_key}
         )
@@ -159,6 +194,7 @@ async def ingest(
 
 
 async def main():
+    """Lee argumentos de CLI, exige una clave, ejecuta la ingesta y cierra el pool."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", type=Path)
     parser.add_argument(

@@ -1,4 +1,8 @@
-"""Opt-in, billable smoke evaluation against indexed documents and real models."""
+"""Evaluación opcional del flujo completo con documentos indexados y modelos reales.
+
+Las llamadas son facturables. El reporte contiene métricas y IDs de casos,
+no respuestas completas ni una certificación de calidad clínica.
+"""
 
 import argparse
 import asyncio
@@ -18,6 +22,18 @@ from app.retrieval import HybridRetriever
 
 
 async def evaluate(path: Path, output: Path):
+    """Ejecuta secuencialmente entre 1 y 100 casos de un dataset JSONL.
+
+    Valida que las fuentes esperadas estén indexadas, invoca el grafo con
+    un timeout por caso y escribe métricas de estado, recuperación de fuentes,
+    citas y latencia. No usa ConversationService ni guarda conversaciones.
+
+    Returns:
+        True si todos los casos devolvieron un estado permitido por el dataset.
+
+    Los errores de configuración, casos o proveedor interrumpen la evaluación;
+    la base siempre se cierra mediante finally.
+    """
     settings = get_settings()
     if not settings.openai_api_key.get_secret_value():
         raise ValueError("Set OPENAI_API_KEY; this evaluation makes billable model calls.")
@@ -92,6 +108,7 @@ async def evaluate(path: Path, output: Path):
 
 
 def main():
+    """Lee dataset y ruta de reporte; termina con código 0 si pasa y 1 si falla."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dataset", type=Path)
     parser.add_argument("--output", type=Path, default=Path("../artifacts/evaluation.json"))

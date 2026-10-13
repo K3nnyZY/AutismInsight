@@ -1,3 +1,10 @@
+"""Entrada ASGI: construye FastAPI y conecta rutas, middleware y servicios.
+
+La API traduce HTTP a operaciones de ConversationService; el flujo de
+recuperación y generación vive en graph.py. Ejecutar migraciones e ingesta
+son tareas separadas: no se realizan automáticamente al iniciar esta aplicación.
+"""
+
 import hashlib
 import logging
 import re
@@ -27,10 +34,15 @@ COOKIE = "autism_insight_session"
 
 
 def owner_hash(value: str) -> str:
+    """Calcula SHA-256 para almacenar o usar un identificador sin conservar su valor original."""
     return hashlib.sha256(value.encode()).hexdigest()
 
 
 def get_owner(request: Request) -> str:
+    """Valida el formato de la cookie y devuelve su hash, o lanza ServiceError 401.
+
+    La autorización de la conversación concreta se comprueba después en el servicio.
+    """
     token = request.cookies.get(COOKIE, "")
     if not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
         raise ServiceError(401, "Inicia una conversación para continuar.")
@@ -38,10 +50,24 @@ def get_owner(request: Request) -> str:
 
 
 def create_app(settings: Settings | None = None, service=None):
+    """Construye la API con configuración explícita o cargada de .env.
+
+    Args:
+        settings: Configuración; si se omite, usa get_settings().
+        service: Servicio sustituible para pruebas de HTTP sin base ni modelos reales.
+
+    Returns:
+        Aplicación FastAPI lista para que un servidor ASGI ejecute su ciclo de vida.
+    """
     settings = settings or get_settings()
 
     @asynccontextmanager
     async def lifespan(application):
+        """Prepara base, clientes y grafo al iniciar y libera la base al terminar.
+
+        Sin clave se mantiene graph=None; la API puede responder a health/live
+        y el servicio devuelve 503 si se intenta generar una respuesta.
+        """
         if service is not None:
             application.state.service = service
             yield
@@ -72,6 +98,11 @@ def create_app(settings: Settings | None = None, service=None):
 
     @application.middleware("http")
     async def boundaries(request: Request, call_next):
+        """Controla origen y tamaño declarado, evita caché y registra estado y duración.
+
+        BodySizeLimit complementa este control contando los bytes realmente recibidos.
+        En producción, POST y DELETE necesitan un Origin permitido.
+        """
         started = time.monotonic()
         origin = request.headers.get("origin")
         if request.method in {"POST", "DELETE"}:
@@ -95,18 +126,21 @@ def create_app(settings: Settings | None = None, service=None):
 
     @application.exception_handler(ServiceError)
     async def service_error(request, error):
+        """Devuelve el estado y mensaje públicos del error; añade Retry-After para 429."""
         headers = {"Retry-After": "60"} if error.status == 429 else None
         return JSONResponse({"detail": error.detail}, status_code=error.status, headers=headers)
 
     @application.exception_handler(TimeoutError)
     async def timeout_error(request, error):
+        """Convierte un TimeoutError en HTTP 504 para permitir reintentar."""
         return JSONResponse(
             {"detail": "La respuesta tardó demasiado. Puedes reintentar."}, status_code=504
         )
 
     @application.exception_handler(Exception)
     async def unexpected_error(request, error):
-        # Avoid leaking upstream provider bodies, credentials, or user text.
+        # No expone cuerpos del proveedor, credenciales ni contenido de la conversación.
+        """Devuelve 503 genérico y registra solo el tipo de excepción."""
         logger.error("request_failed error_type=%s", type(error).__name__)
         return JSONResponse(
             {"detail": "El servicio no está disponible. Puedes reintentar."}, status_code=503
@@ -114,10 +148,16 @@ def create_app(settings: Settings | None = None, service=None):
 
     @application.get("/api/health/live")
     async def live():
+        """Comprueba que la API responde, sin consultar PostgreSQL ni el proveedor."""
         return {"status": "ok"}
 
     @application.get("/api/health/ready")
     async def ready(request: Request):
+        """Comprueba firma del corpus, modelo configurado y documentos habilitados.
+
+        No llama al proveedor: una clave presente no garantiza que sea válida
+        ni que la cuenta tenga acceso al modelo.
+        """
         current = request.app.state.service
         await current.database.check()
         allowed = ["reviewed", "demo"] if settings.demo_sources_enabled else ["reviewed"]
@@ -137,6 +177,11 @@ def create_app(settings: Settings | None = None, service=None):
 
     @application.post("/api/conversations", status_code=201)
     async def create(body: ConversationCreate, request: Request, response: Response):
+        """Crea una conversación con consentimiento y establece la cookie de propietario.
+
+        Limita creaciones por hash de la IP que ve la API. Reutiliza una cookie
+        con formato válido para que el navegador pueda mantener varias conversaciones.
+        """
         if not body.consent:
             raise ServiceError(400, "Se requiere aceptar el procesamiento de la conversación.")
         current = request.app.state.service
@@ -159,15 +204,18 @@ def create_app(settings: Settings | None = None, service=None):
 
     @application.get("/api/conversations/{conversation_id}", response_model=list[MessageView])
     async def history(conversation_id: UUID, request: Request):
+        """Entrega hasta 200 mensajes de una conversación autorizada y vigente."""
         return await request.app.state.service.history(conversation_id, get_owner(request))
 
     @application.delete("/api/conversations/{conversation_id}", status_code=204)
     async def remove(conversation_id: UUID, request: Request):
+        """Elimina una conversación autorizada y sus mensajes; responde sin cuerpo."""
         await request.app.state.service.remove(conversation_id, get_owner(request))
         return Response(status_code=204)
 
     @application.post("/api/chat", response_model=ChatResponse)
     async def chat(body: ChatRequest, request: Request):
+        """Valida la sesión, limita solicitudes y delega la pregunta al servicio."""
         owner = get_owner(request)
         current = request.app.state.service
         await current.rate_limit("chat:" + owner)

@@ -1,1 +1,1 @@
-"""Autism Insight API and retrieval pipeline."""
+"""Paquete del backend: API, conversaciones, recuperación e ingesta de documentos."""

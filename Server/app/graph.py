@@ -1,3 +1,11 @@
+"""Flujo RAG de LangGraph, con rutas explícitas y una reparación máxima.
+
+Cada pregunta recibe estado nuevo. El historial autorizado procede del
+servicio; este módulo no persiste mensajes ni utiliza un checkpointer.
+Los esquemas de salida del modelo se explican con comentarios para no
+cambiar sus descripciones enviadas al proveedor al documentarlos.
+"""
+
 import re
 from typing import Literal, TypedDict
 
@@ -16,32 +24,39 @@ ABSTAIN = (
 )
 
 
+# Base de las salidas del modelo: rechaza campos no previstos en su contrato.
 class ModelSchema(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+# Decisión de ruta y consulta autónoma para resolver preguntas de seguimiento.
 class Plan(ModelSchema):
     route: Literal["knowledge", "conversation", "out_of_scope", "urgent"]
     query: str
 
 
+# IDs locales de fragmentos seleccionados y evaluación de suficiencia del modelo.
 class Selection(ModelSchema):
     ids: list[int]
     sufficient: bool
 
 
+# Borrador todavía no publicable: texto, citas declaradas y señal de falta de evidencia.
 class Draft(ModelSchema):
     answer: str
     citations: list[int]
     insufficient_evidence: bool
 
 
+# Dictamen del modelo verificador; reason permite corregir el siguiente borrador.
 class Verification(ModelSchema):
     supported: bool
     reason: str
 
 
 class GraphState(TypedDict, total=False):
+    """Datos compartidos por los nodos de una sola pregunta; cada nodo añade sus resultados."""
+
     question: str
     history: list[dict]
     audience: str
@@ -59,9 +74,15 @@ class GraphState(TypedDict, total=False):
 
 
 def citation_error(draft: Draft, evidence_count: int) -> str | None:
+    """Devuelve una explicación si las referencias del borrador son inválidas, o None.
+
+    Comprueba IDs disponibles, coincidencia entre citas declaradas y escritas,
+    formato individual [n], ausencia de enlaces y longitud del texto.
+    No verifica hechos: esa tarea corresponde al nodo verify y su modelo.
+    """
     declared = set(draft.citations)
     inline = {int(value) for value in re.findall(r"\[(\d+)\]", draft.answer)}
-    # Ban model-generated links and grouped/ranged references that escape the numeric validator.
+    # Excluye enlaces y referencias agrupadas que no pasan la validación de IDs individuales.
     malformed = any(
         not re.fullmatch(r"\d+", value) for value in re.findall(r"\[([^\]]+)\]", draft.answer)
     )
@@ -75,6 +96,10 @@ def citation_error(draft: Draft, evidence_count: int) -> str | None:
 
 
 def evidence_payload(items: list[Evidence]) -> list[dict]:
+    """Prepara fragmentos para el modelo con IDs numéricos locales empezando en 1.
+
+    Estos IDs son posiciones en esta lista, no los UUID persistidos de los fragmentos.
+    """
     return [
         {
             "id": index,
@@ -88,7 +113,18 @@ def evidence_payload(items: list[Evidence]) -> list[dict]:
 
 
 def build_graph(models, retriever, settings: Settings):
+    """Construye y compila el flujo de una pregunta con dependencias sustituibles.
+
+    Ruta de conocimiento: plan → retrieve → select → generate → verify.
+    Un borrador válido pasa a finalize; uno inválido vuelve a generate una vez
+    y después pasa a abstain. Las otras intenciones pasan directamente a direct.
+    """
+
     async def plan(state):
+        """Clasifica la intención y reescribe la consulta usando el historial.
+
+        Acota query a 1000 caracteres y reinicia el contador de intentos del borrador.
+        """
         result = await models.call(
             Plan,
             prompts.PLAN,
@@ -97,14 +133,21 @@ def build_graph(models, retriever, settings: Settings):
                 "history": state["history"],
             },
         )
-        # Bound rewritten queries independently of provider schema adherence.
+        # Acota la consulta incluso si el proveedor entrega un texto más largo de lo pedido.
         result.query = result.query.strip()[:1000] or state["question"][:1000]
         return {"plan": result, "attempts": 0, "repair_reason": ""}
 
     async def retrieve(state):
+        """Obtiene candidatos con la consulta autónoma generada por plan."""
         return {"candidates": await retriever.search(state["plan"].query)}
 
     async def select_evidence(state):
+        """Pide al modelo evidencia útil y suficiente y valida sus IDs.
+
+        Si no hay candidatos, la selección es insuficiente o los IDs son inválidos,
+        devuelve una lista vacía. La lista útil conserva el orden dado por el modelo
+        y se limita a retrieval_top_k fragmentos.
+        """
         candidates = state["candidates"]
         if not candidates:
             return {"evidence": []}
@@ -123,6 +166,7 @@ def build_graph(models, retriever, settings: Settings):
         return {"evidence": [candidates[n - 1] for n in ids[: settings.retrieval_top_k]]}
 
     async def generate(state):
+        """Genera Draft con evidencia, consulta aclarada, preferencias y motivo de reparación."""
         draft = await models.call(
             Draft,
             prompts.ANSWER,
@@ -139,6 +183,11 @@ def build_graph(models, retriever, settings: Settings):
         return {"draft": draft, "attempts": state["attempts"] + 1}
 
     async def verify(state):
+        """Valida citas y pide al modelo comprobar el soporte factual del borrador.
+
+        Un borrador que declara información insuficiente pasa a abstención sin
+        reparación. Los demás fallos permiten un segundo intento de generación.
+        """
         draft = state["draft"]
         if draft.insufficient_evidence:
             return {"verified": False, "repair_reason": "insufficient", "attempts": 2}
@@ -158,6 +207,7 @@ def build_graph(models, retriever, settings: Settings):
         return {"verified": result.supported, "repair_reason": result.reason[:1000]}
 
     async def finalize(state):
+        """Expone el borrador aceptado y convierte únicamente sus citas en Source."""
         cited = set(state["draft"].citations)
         sources = [
             Source(
@@ -176,9 +226,11 @@ def build_graph(models, retriever, settings: Settings):
         return {"answer": state["draft"].answer, "sources": sources, "evidence_status": "grounded"}
 
     async def abstain(state):
+        """Entrega un mensaje fijo de falta de evidencia, sin exponer el borrador fallido."""
         return {"answer": ABSTAIN, "sources": [], "evidence_status": "insufficient"}
 
     async def direct(state):
+        """Devuelve respuestas fijas para saludo, fuera del dominio y urgencia, sin recuperar."""
         responses = {
             "conversation": (
                 "Hola, soy Autism Insight. Puedo ayudarte a explorar información sobre "
@@ -226,5 +278,5 @@ def build_graph(models, retriever, settings: Settings):
     )
     for name in ("finalize", "abstain", "direct"):
         graph.add_edge(name, END)
-    # Each invocation has fresh graph state; durable, authorized history is loaded by the service.
+    # El servicio carga el historial autorizado; el grafo empieza con estado nuevo por pregunta.
     return graph.compile()

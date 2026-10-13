@@ -1,3 +1,5 @@
+"""Frontera de LangChain con el proveedor: clientes de embeddings y salidas estructuradas."""
+
 import json
 import logging
 import time
@@ -11,6 +13,11 @@ logger = logging.getLogger(__name__)
 
 
 def create_embeddings(settings: Settings, http_async_client=None):
+    """Prepara embeddings con la dimensión del índice, timeout y reintentos acotados.
+
+    http_async_client permite simular el transporte en pruebas. Construir
+    el cliente no indexa documentos ni genera un embedding por sí mismo.
+    """
     return OpenAIEmbeddings(
         model=settings.embedding_model,
         dimensions=EMBEDDING_DIMENSIONS,
@@ -23,9 +30,10 @@ def create_embeddings(settings: Settings, http_async_client=None):
 
 
 class StructuredModels:
-    """LangChain provider boundary. Prompts and source text never enter application logs."""
+    """Clientes para planificación y respuesta, con métricas sin contenido en logs."""
 
     def __init__(self, settings: Settings, http_async_client=None):
+        """Prepara los modelos planner y answer; pueden usar el mismo modelo configurado."""
         options = {
             "api_key": settings.openai_api_key.get_secret_value(),
             "timeout": 30,
@@ -39,6 +47,23 @@ class StructuredModels:
         }
 
     async def call(self, schema, system: str, payload: dict, role: str = "planner"):
+        """Solicita y valida una salida estructurada con un esquema Pydantic.
+
+        Args:
+            schema: Clase que describe el resultado esperado, por ejemplo Plan o Draft.
+            system: Instrucciones del nodo.
+            payload: Datos serializados como JSON en el mensaje de usuario.
+            role: planner o answer, para seleccionar el cliente.
+
+        Returns:
+            Objeto validado del esquema solicitado.
+
+        Raises:
+            RuntimeError: El proveedor rechazó la salida o no pudo interpretarse.
+            Exception: Los errores de transporte del proveedor se propagan a la API.
+
+        Los logs propios incluyen esquema, duración y tokens, no el texto enviado.
+        """
         started = time.monotonic()
         result = (
             await self.models[role]

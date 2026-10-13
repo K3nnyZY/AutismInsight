@@ -1,4 +1,4 @@
-"""Initial corpus, HNSW, full-text index and isolated conversations."""
+"""Revisión 001: corpus, índices de recuperación, conversaciones y contadores de tráfico."""
 
 import sqlalchemy as sa
 from alembic import op
@@ -14,6 +14,11 @@ depends_on = None
 
 
 def upgrade():
+    """Activa pgvector y crea tablas, restricciones, índices HNSW/GIN y firma inicial.
+
+    Los mensajes y fragmentos tienen borrado en cascada. search_vector se
+    calcula en PostgreSQL; rate_buckets se consulta con SQL directo desde el servicio.
+    """
     op.execute("CREATE EXTENSION IF NOT EXISTS vector")
     op.create_table(
         "corpus_config",
@@ -93,6 +98,10 @@ def upgrade():
 
 
 def downgrade():
+    """Revierte la revisión eliminando las tablas en orden de dependencia.
+
+    Es una operación destructiva: elimina los datos de esas tablas.
+    """
     for table in (
         "rate_buckets",
         "messages",

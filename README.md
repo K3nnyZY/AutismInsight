@@ -23,6 +23,8 @@ recuperación híbrida. El PDF original se conserva como material de prueba.
 | Verificación | Pytest, Playwright y CI |
 
 Consulta [las decisiones, el diagrama y los límites de la arquitectura](docs/architecture.md).
+Para entender el código, empieza por [la guía del servidor](Server/README.md): explica
+cada módulo, las funciones, las tablas y el recorrido completo de una pregunta.
 El mejor modelo y los parámetros finales se deben elegir mediante evaluación del
 corpus y preguntas reales; los valores incluidos son un punto de partida medible.
 

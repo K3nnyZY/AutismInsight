@@ -1,4 +1,8 @@
-"""Compatibility entrypoint; prefer `uvicorn app.main:app` from Server/."""
+"""Entrada de desarrollo compatible con `python app.py`.
+
+Inicia Uvicorn en 127.0.0.1:8000. Para configurar recarga y logging,
+usa el comando de Uvicorn explicado en Server/README.md.
+"""
 
 import uvicorn
 
